@@ -8,19 +8,23 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+
 	// Register the pprof endpoints under the web server root at /debug/pprof
 	_ "net/http/pprof"
-	"os"
 	"strconv"
 	"time"
+
+	"cloud.google.com/go/profiler"
+	control "cloud.google.com/go/storage/control/apiv2"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"cloud.google.com/go/profiler"
 	"cloud.google.com/go/storage"
-	"cloud.google.com/go/storage/experimental"
+	//      "cloud.google.com/go/storage/experimental"
+	"cloud.google.com/go/storage/control/apiv2/controlpb"
 	"github.com/googleapis/gax-go/v2"
 	"go.opencensus.io/stats"
 	"golang.org/x/oauth2"
@@ -49,7 +53,7 @@ var (
 	// ProjectName denotes gcp project name.
 	ProjectName = flag.String("project", "gcs-fuse-test", "GCP project name.")
 
-	clientProtocol   = flag.String("client-protocol", "http", "Network protocol.")
+	clientProtocol = flag.String("client-protocol", "http", "Network protocol.")
 
 	// Object name = objectNamePrefix + {thread_id} + objectNameSuffix
 	objectNamePrefix = flag.String("obj-prefix", "princer_100M_files/file_", "Object prefix")
@@ -117,13 +121,13 @@ func CreateHTTPClient(ctx context.Context, isHTTP2 bool) (client *storage.Client
 		wrapped:   httpClient.Transport,
 		UserAgent: "prince",
 	}
-
 	if *enableReadStallRetry {
-		return storage.NewClient(ctx, option.WithHTTPClient(httpClient),
-			experimental.WithReadStallTimeout(&experimental.ReadStallTimeoutConfig{
-				Min: time.Second,
-				TargetPercentile: 0.99,
-			}))
+		// return storage.NewClient(ctx, option.WithHTTPClient(httpClient),
+		//
+		//	experimental.WithReadStallTimeout(&experimental.ReadStallTimeoutConfig{
+		//	        Min: time.Second,
+		//	        TargetPercentile: 0.99,
+		//	}))
 	}
 	return storage.NewClient(ctx, option.WithHTTPClient(httpClient))
 }
@@ -134,7 +138,56 @@ func CreateGrpcClient(ctx context.Context) (client *storage.Client, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return storage.NewGRPCClient(ctx, option.WithGRPCConnectionPool(grpcConnPoolSize), option.WithTokenSource(tokenSource), storage.WithDisabledClientMetrics())
+	_ = tokenSource
+	return storage.NewGRPCClient(ctx)//, option.WithGRPCConnectionPool(grpcConnPoolSize), option.WithTokenSource(tokenSource))
+}
+
+// CreateStorageControlClient creates control client.
+func CreateAndPerformControlClientOperation(ctx context.Context) (err error) {
+	tokenSource, err := GetTokenSource(ctx, "")
+	if err != nil {
+		return err
+	}
+
+	// , storage.WithDisabledClientMetrics()
+	ctrlClient, err := control.NewStorageControlClient(ctx, option.WithGRPCConnectionPool(grpcConnPoolSize), option.WithTokenSource(tokenSource))
+	if err != nil {
+		return err
+	}
+
+	startTime := time.Now()
+	var callOptions []gax.CallOption
+	storageLayout, err := ctrlClient.GetStorageLayout(context.Background(), &controlpb.GetStorageLayoutRequest{
+		Name:      fmt.Sprintf("projects/_/buckets/%s/storageLayout", *bucketName),
+		Prefix:    "",
+		RequestId: "",
+	}, callOptions...)
+
+	fmt.Println("Time taken (second) in storageLayoutFetch: ", time.Since(startTime).Seconds())
+	timeCheck1 := time.Now()
+	namespace := storageLayout.GetHierarchicalNamespace()
+	fmt.Println("Time taken (second) in namespace fetch: ", time.Since(timeCheck1).Seconds())
+	fmt.Println(namespace)
+
+	return nil
+}
+
+func ListTest(ctx context.Context, client *storage.Client) error {
+	startTime := time.Now()
+
+	it := client.Bucket(*bucketName).Objects(ctx, nil)
+
+	fmt.Println("Time taken (second) in Objects: ", time.Since(startTime).Seconds())
+	timeCheck1 := time.Now()
+	o, err := it.Next()
+	if err != nil {
+		return fmt.Errorf("listing err: %v", err)
+	}
+
+	fmt.Println("Time taken (second) in it.next: ", time.Since(timeCheck1).Seconds())
+	fmt.Println(o.Name)
+
+	return nil
 }
 
 // ReadObject creates reader object corresponding to workerID with the help of bucketHandle.
@@ -181,8 +234,8 @@ func main() {
 	ctx := context.Background()
 
 	if *enableTracing {
-		cleanup := enableTraceExport(ctx, *traceSampleRate)
-		defer cleanup()
+		//              cleanup := enableTraceExport(ctx, *traceSampleRate)
+		//              defer cleanup()
 	}
 
 	// Start a pprof server.
@@ -216,8 +269,27 @@ func main() {
 	var err error
 	if *clientProtocol == "http" {
 		client, err = CreateHTTPClient(ctx, false)
+	} else if *clientProtocol == "grpc" {
+		client, err = CreateGrpcClient(ctx)
+	} else if *clientProtocol == "control" {
+		err := CreateAndPerformControlClientOperation(ctx)
+		if err != nil {
+			fmt.Printf("while creating the client: %v", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	} else {
 		client, err = CreateGrpcClient(ctx)
+		if err != nil {
+			fmt.Printf("while creating the client: %v", err)
+			os.Exit(1)
+		}
+		defer client.Close()
+		if err := ListTest(ctx, client); err != nil {
+			fmt.Printf("listest: %v", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 
 	if err != nil {
@@ -234,7 +306,6 @@ func main() {
 
 	// assumes bucket already exist
 	bucketHandle := client.Bucket(*bucketName)
-
 	// Enable stack-driver exporter.
 	registerLatencyView()
 	registerFirstByteLatencyView()
@@ -260,7 +331,6 @@ func main() {
 	}
 
 	err = eG.Wait()
-
 	if err == nil {
 		fmt.Println("Read benchmark completed successfully!")
 	} else {
@@ -268,3 +338,4 @@ func main() {
 		os.Exit(1)
 	}
 }
+
